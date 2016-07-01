@@ -1,0 +1,31 @@
+<html>
+	<head>
+		<script>
+			function utf8_to_b64(str) {
+			    return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, function(match, p1) {
+			        return String.fromCharCode('0x' + p1);
+			    }));
+			}
+
+			function encode() {
+				var input = document.getElementById("toencode").value;
+				try {
+					var output = utf8_to_b64(input);
+				}
+				catch(err) {
+					output = err;
+				}
+				document.getElementById("encoded").value = output;
+				return false;
+			}
+		</script>
+	</head>
+	<body>
+		<form onsubmit="return encode()">
+			<input id="toencode" type="text"/><br>
+			<input type="submit" value="Encode">
+		</form>
+		<textarea id="encoded">
+		</textarea>
+	</body>
+</html>
