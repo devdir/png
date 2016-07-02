@@ -1,0 +1,362 @@
+<html>
+	<head>
+		<script type='text/worker' id='worker-script'>
+			function equalBytes(a, b){
+				if (a.length != b.length) return false;
+				for (var l = a.length; l--;) if (a[l] != b[l]) return false;
+				return true;
+			}
+
+			class LzwByteIterator {
+				constructor(data, lzwMinCodeSize) {
+					this.bits = new Stream(data).bits();
+					this.lzwMinCodeSize = lzwMinCodeSize;
+					this.clearCode = 1 << lzwMinCodeSize;
+					this.endCode = this.clearCode + 1;
+					this.codeSize = lzwMinCodeSize + 1;
+					this.dict = [];
+				}
+
+				clear() {
+					this.dict = [];
+					this.codeSize = this.lzwMinCodeSize + 1;
+					for (var i = 0; i < this.clearCode; i++) {
+						this.dict[i] = [i];
+					}
+					this.dict[this.clearCode] = [];
+					this.dict[this.endCode] = null;
+				}
+
+				readCode(size) {
+					var code = 0;
+					for (var i = 0; i < size; i++) {
+						if (this.bits.next().value) {
+							code |= 1 << i;
+						}
+					}
+					return code;
+				}
+
+				* lzwBytes() {
+					var code;
+					var last;
+					while (true) {
+						last = code;
+						code = this.readCode(this.codeSize);
+						if (code === this.clearCode) {
+							  this.clear();
+							  continue;
+						}
+						if (code === this.endCode) break;
+
+						if (code < this.dict.length) {
+							if (last !== this.clearCode) {
+								this.dict.push(this.dict[last].concat(this.dict[code][0]));
+							}
+						} else {
+							if (code !== this.dict.length) 
+								throw new Error('Invalid LZW code.');
+							this.dict.push(this.dict[last].concat(this.dict[last][0]));
+						}
+						
+						yield* this.dict[code];
+
+						if (this.dict.length === (1 << this.codeSize) && this.codeSize < 12) {
+						 	this.codeSize++;
+						}
+					}				
+				}
+			}
+
+			class PixelIteratorState {
+				constructor() {
+					this.newPass = true;
+					this.newLine = false;
+				}
+
+				reset() {
+					this.newPass = false;
+					this.newLine = false;
+				}
+			}
+
+			class PixelIterator {
+				constructor(width, height) {
+					this.state = new PixelIteratorState();
+					this.width = width;
+					this.height = height;
+					this.coord = { x: 0, y: 0 };
+				}
+			}
+
+			class NonInterlacedIterator extends PixelIterator {
+				* [Symbol.iterator]() {
+					while(this.coord.y < this.height) {	
+						while(this.coord.x < this.width) {
+							yield this.coord;
+							this.coord.x++;
+							this.state.reset();
+						}
+						this.coord.y++;
+						this.coord.x = 0;
+						this.state.newLine = true;
+					}				
+				}
+			}
+
+			class GifInterlacedIterator extends PixelIterator {
+				* [Symbol.iterator]() {
+					var offsets = [0,4,2,1];
+					var steps   = [8,8,4,2];
+					for (var pass = 0; pass < 4; pass++) {
+						this.state.newPass = true;
+						this.coord.y = offsets[pass];
+						while (this.coord.y < this.height) {
+							this.coord.x = 0;
+							while (this.coord.x < this.width) {
+								yield this.coord;
+								this.coord.x++;
+								this.state.reset();
+							}
+							this.coord.y += steps[pass];
+							this.state.newLine = true;
+						}
+					}			
+				}			
+			}
+
+			class Gif {
+				constructor(stream, worker) {				
+					this._stream = stream;
+					this._worker = worker;
+			
+					this.readSignature();
+					this.readLogicalScreenDescriptor();
+					this.blocks = [];
+					for(var block of this.readData()) {
+						this.blocks.push(block);
+					}
+					this.decodeImage(this.blocks[0]);
+				}
+
+				readSignature() {
+				    var sig = this._stream.readBytes(6);
+				    if (equalBytes(sig, [0x47, 0x49, 0x46, 0x38, 0x37, 0x61]) || equalBytes(sig, [0x47, 0x49, 0x46, 0x38, 0x39, 0x61])) {
+				    	// 87 of 89 in [4]
+					} else {
+						throw { message: "Signature is not of a GIF file." + sig };
+					}	
+		            postMessage({ 
+		                result: "signature: " + sig
+		            }); 								
+				}
+
+				readLogicalScreenDescriptor() {
+					var buffer = this._stream.readBytes(7);
+					this.SCREEN = {
+						width            : this._stream.readUint16(buffer, 0),
+						height           : this._stream.readUint16(buffer, 2),
+						packed           : buffer[4],
+						backgroundColor  : buffer[5],
+						pixelAspectRatio : buffer[6]
+					};	
+					this.SCREEN.GCT_follows    = this.SCREEN.packed & 0x80 != 0;
+					this.SCREEN.GCT_resolution = (this.SCREEN.packed & 0x70 >> 4) + 1;
+					this.SCREEN.GCT_sorted     = this.SCREEN.packed & 0x80 != 0;
+					this.SCREEN.GCT_size       = (this.SCREEN.packed & 0x07) + 1;
+		            postMessage({ 
+		                result: this.SCREEN
+		            }); 					
+					if (this.SCREEN.GCT_follows) {
+						this.readGlobalColorTable();
+					}				
+				}
+
+				readGlobalColorTable() {
+				    var colorCount = 1 << this.SCREEN.GCT_size;
+					var buffer = this._stream.readBytes(3 * colorCount);
+					this.palette = [];
+					for(var i=0; i < colorCount; i++) {
+						this.palette.push([ buffer[i*3], buffer[i*3+1], buffer[i*3+2] ]);
+					}
+		            postMessage({ 
+		                result: this.palette
+		            }); 					
+				}
+
+				readImage(block) {
+					var buffer = this._stream.readBytes(9);
+				    block.leftPos = this._stream.readUint16(buffer, 0);
+				    block.topPos = this._stream.readUint16(buffer, 2);
+				    block.width = this._stream.readUint16(buffer, 4);
+				    block.height = this._stream.readUint16(buffer, 6);
+				    block.packed = buffer[8];
+
+					block.LCT_follows = block.packed & 0x80 != 0;
+					block.interlaced  = block.packed & 0x40 != 0;
+					block.sorted      = block.packed & 0x20 != 0;
+					block.LCT_size    = (block.packed & 0x07) + 1;
+
+					if (block.LCT_follows) {
+						console.log("TODO read local color table");
+					}
+
+					block.lzwMinCodeSize = this._stream.readByte();
+
+					block.blobs = [];
+					var size, blob;
+					do {
+						size = this._stream.readByte();
+						blob = this._stream.getBlob(this._stream.position, size);
+						this._stream.position += size;
+						block.blobs.push(blob);
+					} while(size != 0);
+				}
+
+				decodeImage(block) {
+					var bytes = new LzwByteIterator(new Blob(block.blobs), block.lzwMinCodeSize).lzwBytes();
+
+					this._imageData = new ImageData(block.width, block.height);
+
+					for(var pixel of new GifInterlacedIterator(block.width, block.height))
+					{
+						var color = this.palette[bytes.next().value];
+						//console.log(pixel);
+						var pd = pixel.y * block.width * 4 + pixel.x * 4;
+						this._imageData.data[pd++] = color[0];
+						this._imageData.data[pd++] = color[1];
+						this._imageData.data[pd++] = color[2];
+						this._imageData.data[pd++] = 255;						
+					}
+					postMessage({ 
+		                result: this._imageData
+		            });					
+				}
+
+				* readData() {
+					// x00-0x7F (0-127) are the Graphic Rendering blocks, excluding the Trailer (0x3B); 
+					// 0x80-0xF9 (128-249) are the Control blocks;
+					// 0xFA-0xFF (250-255) are the Special Purpose blocks.
+					var endBlock = false;
+					while(!this._stream.EOF && !endBlock)
+					{
+						var block = { };
+						block.id = this._stream.readByte();
+					    switch (String.fromCharCode(block.id)) {
+					      case '!':
+					        break;
+					      case ',':
+					      	this.readImage(block);
+					        break;
+					      case ';':
+					      	console.log("end block");
+					      	endBlock = true;
+					        break;
+					      default:
+					        throw new Error('Unknown block: 0x' + block.id.toString(16));
+					    }
+					    yield block;
+				    }
+				}
+			}
+
+		    self.addEventListener('message', function(e) { 
+		    	self.importScripts(e.data.url + '/stream.js');
+		        try {
+		        	var png = new Gif(new Stream(e.data.file), this);
+		       } catch(e){ 
+		            postMessage({ 
+		                result: e.message + " " + e.stack
+		            }); 
+		       }
+		    }, false);
+		</script>
+		<script>
+			function makeWorker(script) {
+			    return new Worker(URL.createObjectURL(new Blob([script])));
+			}
+
+			function processFile(file, cb) {
+			    var syncWorker = makeWorker(
+			        document.getElementById('worker-script').textContent
+			    );
+			    
+			    if (syncWorker) {
+			        syncWorker.onmessage = function(e) {
+			            cb(e.data.result);
+			        };
+			        syncWorker.postMessage({ url: window.location.protocol + '//' + window.location.host, file: file });
+			    }
+			}
+
+			function handleFile(evt) {
+    			var files = evt.target.files;;
+
+		        processFile(files[0], function(src) {
+		        	if (src instanceof ImageData) {
+		        		var canvas = document.getElementById("canvas");
+		        		canvas.width = src.width;
+		        		canvas.height = src.height;
+		        		var ctx = canvas.getContext('2d');
+		        		ctx.putImageData(src, 0, 0);
+		        	} else {
+		        		console.log(src);
+		        	}
+		        });
+			}
+
+			function loadTest(url, text) {
+				var dv = document.createElement("div");
+				var img = document.createElement("img");
+				img.src = url;			
+				dv.appendChild(img);
+        		var canvas = document.createElement("canvas");
+        		canvas.width = 32;
+        		canvas.height = 32;
+        		dv.appendChild(canvas);				
+				var span = document.createElement("span");
+				span.textContent = text;
+				dv.appendChild(span);
+				document.body.appendChild(dv);				
+				var x = new XMLHttpRequest();
+				x.open("GET", url, true);
+				x.responseType = 'blob';
+				x.onload = function (e) {
+			        processFile(x.response, function(src) {
+			        	if (src instanceof ImageData) {
+			        		canvas.width = src.width;
+			        		canvas.height = src.height;
+			        		var ctx = canvas.getContext('2d');
+			        		ctx.putImageData(src, 0, 0);
+			        	} else {
+			        		console.log(src);
+			        	}
+			        });						
+				}
+				x.send();		
+			}
+
+			function loadTests() {
+				var x = new XMLHttpRequest();				
+				x.open("GET", "testcases_gif.json", true);
+				x.responseType = 'json';	
+				x.onload = function(e) {
+					var imgs = e.target.response;
+					var cnt = 0;
+					for(var i=0; i<imgs.length; i++) {
+						var parts = imgs[i].split(" ");
+						//if (parts[0] != "basn0g01") continue;
+						if(parts[0].substring(0, 4) != "http")
+							parts[0] = "testsuite/" + parts[0] + ".gif";
+						loadTest(parts[0], imgs[i]);
+					}
+				}
+				x.send();
+			}
+		</script>
+	</head>
+	<body>
+		<input type="file" onchange="handleFile(event)"/>
+		<input type="button" onclick="loadTests()"/>
+	</body>
+</html>
