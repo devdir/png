@@ -194,15 +194,12 @@
 					var block_width   = [ 8, 4, 4, 2, 2, 1, 1 ];
 					var pass = 0;
 					  
-					while (pass < 7)
-					{
+					while (pass < 7) {
 						this.state.newPass = true;
 					    this.coord.y = starting_row[pass];
-					    while (this.coord.y < this.height)
-					    {
+					    while (this.coord.y < this.height) {
 					        this.coord.x = starting_col[pass];
-					        while (this.coord.x < this.width)
-					        {
+					        while (this.coord.x < this.width) {
 								yield this.coord;
 								this.state.reset();
 					            // these are h/w for interlaced display Math.min(block_height[pass], this.height - row), Math.min(block_width[pass], this.width - col)
@@ -214,7 +211,105 @@
 					    pass = pass + 1;
 					}			
 				}
-			}			
+			}
+
+			class BytesIterator {
+				constructor(data, pixelState, width, bitsPerPixel) {
+					this.data = data;
+					this.bitsPerPixel = bitsPerPixel;
+					this.bytesPerPixel = Math.max(bitsPerPixel / 8 | 0, 1);
+					this.pixelsPerByte = 8 / this.bitsPerPixel | 0;
+					this.lineBufferLength = width * this.bytesPerPixel;
+					this.pixelState = pixelState;
+					this.bufferState = { };
+					this.filters = [
+						this.filterNone,
+						this.filterSub,
+						this.filterUp,
+						this.filterAverage,
+						this.filterPaeth
+					];					
+				}
+
+				filterNone(byte, offset) {
+					return byte;
+				}
+
+				filterSub(byte, offset) {
+					var idx = offset - this.bytesPerPixel;
+					var a = idx < 0 ? 0 : this.bufferState.currentLine[idx];
+					return (byte + a) & 255;
+				}
+
+				filterUp(byte, offset) {
+					var b = this.bufferState.previousLine[offset] || 0;
+					return (byte + b) & 255;
+				}
+
+				filterAverage(byte, offset) {
+					var idx = offset - this.bytesPerPixel;
+					var a = idx < 0 ? 0 : this.bufferState.currentLine[idx];
+					var b = this.bufferState.previousLine[offset] || 0;
+					return (byte + Math.floor((a + b) / 2.0)) & 255;			
+				}	
+
+				filterPaeth(byte, offset) {
+					var idx = offset - this.bytesPerPixel;
+					var a = idx < 0 ? 0 : this.bufferState.currentLine[idx];
+					var b = this.bufferState.previousLine[offset] || 0;
+					var c = idx < 0 ? 0 : this.bufferState.previousLine[idx] || 0;
+					var Pr = 0;
+				    var p = a + b - c;
+				    var pa = Math.abs(p - a);
+				    var pb = Math.abs(p - b);
+				    var pc = Math.abs(p - c);
+				    if (pa <= pb && pa <= pc) {
+				    	Pr = a;
+				    } else if (pb <= pc)
+				    	Pr = b;
+				    else 
+				    	Pr = c;
+					return (byte + Pr) & 255;				
+				}
+
+				* generator() {
+					var bufferX = 0;
+					var filter, bytes, fullbyte;
+					while (true) {
+			        	if (this.pixelState.newPass) {
+							this.bufferState.previousLine = new Uint8ClampedArray(this.lineBufferLength);
+							this.bufferState.currentLine = new Uint8ClampedArray(this.lineBufferLength);
+			        	} else if (this.pixelState.newLine) {
+							this.bufferState.previousLine = this.bufferState.currentLine;
+							this.bufferState.currentLine = new Uint8ClampedArray(this.lineBufferLength);
+			        	}
+			        	if (this.pixelState.newPass | this.pixelState.newLine) {
+							filter = this.filters[this.data.next().value].bind(this);
+							bufferX = 0;
+			        	}
+						if (this.bitsPerPixel < 8) {
+							if (bufferX % this.pixelsPerByte == 0) {
+								fullbyte = filter(this.data.next().value, bufferX / this.pixelsPerByte | 0);
+								this.bufferState.currentLine[bufferX / this.pixelsPerByte | 0] = fullbyte;
+							}
+							var maskshift = [undefined, 0x01, 0x02, undefined, 0x04][this.bitsPerPixel] * (bufferX % this.pixelsPerByte);
+							var mask = [undefined, 0x80, 0xC0, undefined, 0xF0][this.bitsPerPixel] >> maskshift;
+							var shift = [undefined, 7, 6, undefined, 4][this.bitsPerPixel] - maskshift;	
+							bytes = [(fullbyte & mask) >> shift];
+							bufferX++;
+						} else {
+							bytes = [];
+							for(var b = 0; b < this.bytesPerPixel; b++) {
+								var byte = filter(this.data.next().value, bufferX);
+								this.bufferState.currentLine[bufferX] = byte;
+								bytes.push(byte);
+								bufferX++;
+							}
+						}
+						yield bytes;
+					}		
+				}
+			}
 
 			class Png {
 				scaleColorComponent(high, low) {
@@ -234,13 +329,6 @@
 					this._worker = worker;
 					this._chunks = [];
 					this._data = [];
-					this._filters = [
-						this.filterNone,
-						this.filterSub,
-						this.filterUp,
-						this.filterAverage,
-						this.filterPaeth
-					];
 
 					this.readSignature();
 					this.scanChunks();					
@@ -299,86 +387,6 @@
 					this._gamma = this._stream.readUint32(buffer, 0) / 100000.0;				
 				}				
 
-				filterNone(byte, offset, bufferState) {
-					return byte;
-				}
-
-				filterSub(byte, offset, bufferState) {
-					var idx = offset - Math.max(this.IHDR.bytesPerPixel, 1);
-					var a = idx < 0 ? 0 : bufferState.currentLine[idx];
-					return (byte + a) & 255;
-				}
-
-				filterUp(byte, offset, bufferState) {
-					var b = bufferState.previousLine[offset] || 0;
-					return (byte + b) & 255;
-				}
-
-				filterAverage(byte, offset, bufferState) {
-					var idx = offset - Math.max(this.IHDR.bytesPerPixel, 1);
-					var a = idx < 0 ? 0 : bufferState.currentLine[idx];
-					var b = bufferState.previousLine[offset] || 0;
-					return (byte + Math.floor((a + b) / 2.0)) & 255;			
-				}	
-
-				filterPaeth(byte, offset, bufferState) {
-					var idx = offset - Math.max(this.IHDR.bytesPerPixel, 1);
-					var a = idx < 0 ? 0 : bufferState.currentLine[idx];
-					var b = bufferState.previousLine[offset] || 0;
-					var c = idx < 0 ? 0 : bufferState.previousLine[idx] || 0;
-					var Pr = 0;
-				    var p = a + b - c;
-				    var pa = Math.abs(p - a);
-				    var pb = Math.abs(p - b);
-				    var pc = Math.abs(p - c);
-				    if (pa <= pb && pa <= pc) {
-				    	Pr = a;
-				    } else if (pb <= pc)
-				    	Pr = b;
-				    else 
-				    	Pr = c;
-					return (byte + Pr) & 255;				
-				}
-
-				* newBytes(data, state) {
-					var bufferX = 0;
-					var filter, bytes, fullbyte;
-					var bufferState = { };
-					while(true) {
-			        	if (state.newPass) {
-							bufferState.previousLine = new Uint8ClampedArray(this.IHDR.lineBufferLength);
-							bufferState.currentLine = new Uint8ClampedArray(this.IHDR.lineBufferLength);
-			        	} else if (state.newLine) {
-							bufferState.previousLine = bufferState.currentLine;
-							bufferState.currentLine = new Uint8ClampedArray(this.IHDR.lineBufferLength);			        	
-			        	}
-			        	if (state.newPass | state.newLine) {
-							filter = this._filters[data.next().value].bind(this);
-							bufferX = 0;
-			        	}
-						if (this.IHDR.bitsPerPixel < 8) {
-							if (bufferX % this.IHDR.pixelsPerByte == 0) {
-								fullbyte = filter(data.next().value, bufferX / this.IHDR.pixelsPerByte | 0, bufferState);
-								bufferState.currentLine[bufferX / this.IHDR.pixelsPerByte | 0] = fullbyte;
-							}
-							var maskshift = [undefined, 0x01, 0x02, undefined, 0x04][this.IHDR.bitsPerPixel] * (bufferX % this.IHDR.pixelsPerByte);
-							var mask = [undefined, 0x80, 0xC0, undefined, 0xF0][this.IHDR.bitsPerPixel] >> maskshift;
-							var shift = [undefined, 7, 6, undefined, 4][this.IHDR.bitsPerPixel] - maskshift;	
-							bytes = [(fullbyte & mask) >> shift];
-							bufferX++;
-						} else {
-							bytes = [];
-							for(var b = 0; b < this.IHDR.bytesPerPixel; b++) {
-								var byte = filter(data.next().value, bufferX, bufferState);
-								bufferState.currentLine[bufferX] = byte;
-								bytes.push(byte);
-								bufferX++;
-							}
-						}
-						yield bytes;
-					}
-				}
-
 				gammaCorrect(color) {
 					var reciprocalGamma = 1 / ((this._gamma || 1) * 1.8);
 					for(var i=0; i<3; i++) {
@@ -402,7 +410,7 @@
 					this._state = { };
 					var pixelColor = { };
 					var pixels =  this.IHDR.interlaceMethod == 0 ? new NonInterlacedIterator(this.IHDR.width, this.IHDR.height) : new Adam7Iterator(this.IHDR.width, this.IHDR.height);					
-					var data = this.newBytes(data, pixels.state);
+					var data = new BytesIterator(data, pixels.state, this.IHDR.width, this.IHDR.bitsPerPixel).generator();
 					var color = [];
 					for(var coord of pixels) {
 						var bytes = data.next().value;
