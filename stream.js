@@ -44,9 +44,40 @@ class Stream {
 		}
 	}
 
+	* bufferedBits() {
+		var pos = this._position;
+		var left = this._length - this._position;
+		while(left > 0) {
+			var buffer = this.readBytes(Math.min(left, 65536));
+			left -= buffer.length;
+			console.log("left", left, "pos", this._position);			
+			var bufpos = 0;
+			var lastbyte;
+			while(bufpos < buffer.length) {
+				// skip 00 if FF00
+				var byte = buffer[bufpos];
+				if (lastbyte == 0xff) {
+					if (byte == 0) {
+						lastbyte = 0;
+						bufpos++;
+						//console.log("skipping stuffed byte");
+						continue;
+					} else {
+						throw { message: "marker encountered" + (0xff00 + byte).toString(16) }
+					}
+				}
+				// could also throw exception if lastbyte = 0xff and byte != 0
+				for(var bit=7; bit>=0; bit--) {
+					yield buffer[bufpos] >> bit & 1;
+				}
+				lastbyte = byte;
+				bufpos++;
+			}			
+		}
+	}
+
 	getBlob(position, length) {
 		if (position + length > this._length) {
-			debugger;
 			throw { message: "passed end" };
 		}
 		return this._file.slice(position, position + length);
@@ -87,17 +118,16 @@ class Stream {
 	}
 
 	readUint16(buffer, offset) {
-		// TODO for GIF reverse endianess
 		buffer = buffer || this.readBytes(2);
 		offset = offset || 0;
 		if (offset + 2 > buffer.length)
 			throw { message: "read pas end" };
 		if (this._endianness == 'LE') {
-			return ((buffer[offset + 1] <<  8) +
-				    (buffer[offset + 0] <<  0)) >>> 0;
-		} else {
 			return ((buffer[offset + 0] <<  8) +
 				    (buffer[offset + 1] <<  0)) >>> 0;
+		} else {
+			return ((buffer[offset + 1] <<  8) +
+				    (buffer[offset + 0] <<  0)) >>> 0;
 		}
 	}	
 }

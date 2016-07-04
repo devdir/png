@@ -1,0 +1,563 @@
+<!-- before refactor 711 -> 574 lines -->
+<html>
+	<head>
+		<script type='text/worker' id='worker-script'>
+			class HuffmanIterator {
+				constructor(data, lens, vals) {
+					this.data = data;
+					this.node = this.constructTable(lens, vals);
+				}
+
+		        constructTable(lens, vals) {
+		            var k = 0, code = [], i, j, length = 16;
+		            while (length > 0 && !lens[length - 1]) {
+		                length--;
+		            }
+		            code.push({
+		                children: [],
+		                index: 0
+		            });
+		            var p = code[0], q;
+		            for (i = 0; i < length; i++) {
+		                for (j = 0; j < lens[i]; j++) {
+		                    p = code.pop();
+		                    p.children[p.index] = vals[k];
+		                    while (p.index > 0) {
+		                        p = code.pop();
+		                    }
+		                    p.index++;
+		                    code.push(p);
+		                    while (code.length <= i) {
+		                        code.push(q = {
+		                            children: [],
+		                            index: 0
+		                        });
+		                        p.children[p.index] = q.children;
+		                        p = q;
+		                    }
+		                    k++;
+		                }
+		                if (i + 1 < length) {
+		                    code.push(q = {
+		                        children: [],
+		                        index: 0
+		                    });
+		                    p.children[p.index] = q.children;
+		                    p = q;
+		                }
+		            }
+		            return code[0].children;
+		        }
+
+	            decode() {
+	                var node = this.node;
+	                while (true) {
+	                	var bit = this.data.next().value;
+	                    node = node[bit];                    
+	                    if (typeof node === "number") {                    
+	                        return node;
+	                    }
+	                    if (typeof node !== "object") {
+	                        throw { message: "invalid huffman sequence" };
+	                    }
+	                }
+	            }
+			}
+
+			var zigzag = new Uint8Array([ 0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63 ]);
+
+			class Jpg {
+				constructor(stream, worker) {				
+					this._stream = stream;
+					this._worker = worker;		
+
+					var len = 65535;
+
+					while (!this._stream.EOF) {
+						var buffer = this._stream.readBytes(this._stream._length);					
+						for(var i=0; i<buffer.length-1; i++) {
+							if (buffer[i] == 0xff && buffer[i+1] != 0x00) {
+								console.log("pos ", i, (buffer[i]*256 + buffer[i+1]).toString(16));
+							}
+						}
+					}
+					this._stream.position = 0;
+
+					this.quantizationTables = [];
+					this.acTables = [];
+					this.dcTables = [];
+					var marker = this._stream.readByte();
+					while(marker == 0xFF) {
+						var code = this._stream.readByte();
+						console.log("maincode", code.toString(16));
+
+						if (code == 0xD8) {
+							this.readImage();
+						} else {
+							console.log("unknown", code);
+						}
+						marker = this._stream.readByte();
+					}
+					console.log("exit", marker);
+					console.log(this._stream.readBytes(8));
+				}
+
+				readApplicationSegment(code) {
+					var len = this._stream.readUint16();
+					console.log("app", (0xff00 + code).toString(16), "len", len);
+					this._stream.position += len - 2;
+				}
+
+				readQuantizationTable(code) {
+					var len = this._stream.readUint16();
+					console.log("quant", (0xff00 + code).toString(16), "len", len);
+					var buffer = this._stream.readBytes(len - 2);
+					var pos = 0;
+					while (pos < len - 2) {				
+						var table = {
+							precision: (buffer[pos] & 0xF0) >> 4,
+							id: buffer[pos] & 0x0F,
+							items: []
+						}				
+						pos++;
+						for (var i=0; i<64; i++) {
+							if (table.precision == 1) {
+								table.items[zigzag[i]] = this._stream.readUint16(buffer, pos);
+								//table.items[i] = this._stream.readUint16(buffer, pos);
+								pos += 2;
+							} else {
+								table.items[zigzag[i]] = buffer[pos];
+								//table.items[i] = buffer[pos];
+								pos++;
+							}
+						}
+						this.quantizationTables[table.id] = table;
+						console.log(JSON.stringify(table));						
+					}
+					// this._stream.position += len - 2;
+				}
+
+				readHuffmanTable(code) {
+					var len = this._stream.readUint16();
+					console.log("huff", (0xff00 + code).toString(16), "len", len);
+					var buffer = this._stream.readBytes(len - 2);
+					var pos = 0;
+					while(pos < len-2) {
+						var table = {
+							class: (buffer[pos] & 0xF0) >> 4,
+							id: buffer[pos++] & 0x0F,
+							lens: buffer.slice(pos, pos+16),	
+							vals: []			
+						}
+						pos += 16;
+						for(var i=0; i<16; i++) {
+							for(var j=0; j<table.lens[i]; j++) {
+								table.vals.push(buffer[pos++]);
+							}
+						}
+						if (table.class == 1) {
+							this.acTables[table.id] = table;
+						} else {
+							this.dcTables[table.id] = table;
+						}					
+					}
+					// this._stream.position += len - 2;
+				}
+
+				readBaselineDCT(code) {
+					var len = this._stream.readUint16();
+					console.log("base DCT", (0xff00 + code).toString(16), "len", len);
+					var buffer = this._stream.readBytes(len - 2);
+					this.frame = {
+						samplePrecision: buffer[0],
+						numberOfLines: this._stream.readUint16(buffer, 1),
+						samplesPerLine: this._stream.readUint16(buffer, 3),
+						numberOfComponents: buffer[5],
+						components: []
+					}
+					var pos = 6;
+					var maxH = 0, maxV = 0;
+					for(var i=0; i<this.frame.numberOfComponents; i++) {
+						var component = {
+							id: buffer[pos++],
+							horSamplingFactor: (buffer[pos] & 0xF0) >> 4,
+							verSamplingFactor: buffer[pos++] & 0x0F,
+							quantizationTableId: buffer[pos++]
+						}
+                        if (maxH < component.horSamplingFactor) {
+                            maxH = component.horSamplingFactor;
+                        }
+                        if (maxV < component.verSamplingFactor) {
+                            maxV = component.verSamplingFactor;
+                        }						
+						this.frame.components[component.id] = component;
+					}
+					this.frame.maxH = maxH;
+					this.frame.maxV = maxV;
+					// this._stream.position += len - 2;
+				}
+
+				readStartOfScan(code) {
+					var len = this._stream.readUint16();
+					console.log("SOS", (0xff00 + code).toString(16), "len", len);
+					var buffer = this._stream.readBytes(len - 2);
+					this.scan = {
+						numberOfComponents: buffer[0],
+						components: []
+					}
+					var pos = 1;
+					for(var j=0; j<this.scan.numberOfComponents; j++) {
+						var component = {
+							selector: buffer[pos++],
+							dcEntropyTableDest: (buffer[pos] & 0xF0) >> 4,
+							acEntropyTableDest: buffer[pos++] & 0x0F					
+						}
+						this.scan.components.push(component);
+					}
+					this.scan.spectralSelectionStart = buffer[pos++];
+					this.scan.specrralSelectionEnd = buffer[pos++];
+					this.scan.approxHigh = (buffer[pos] & 0xF0) >> 4;
+					this.scan.approxLow = buffer[pos++] & 0x0F;
+					// this._stream.position += len - 2;
+					this.decodeScan();
+				}
+
+				* MinimalCodingUnits() {
+					var unit = { x: 0, y: 0 };
+					while(unit.y < this.frame.numberOfLines / 8 / this.frame.maxV) {
+						unit.x = 0;
+						while(unit.x < this.frame.samplesPerLine / 8 / this.frame.maxH) {
+							yield unit;
+							unit.x += 1;
+						}
+						console.log(unit);
+						unit.y += 1;
+					}
+				}
+
+				* Blocks(mcu) {
+					var block = { h: 0, v: 0, component: null, mcu: mcu };	
+					for(var idx=0; idx < this.scan.numberOfComponents; idx++) {
+						block.component = this.frame.components[this.scan.components[idx].selector];
+						block.h = 0;
+						block.v = 0;
+
+						while(block.v < block.component.verSamplingFactor) {
+							block.h = 0;
+							while(block.h < block.component.horSamplingFactor) {
+								block.offset = 64 * (block.v * block.component.horSamplingFactor + block.h * block.component.verSamplingFactor);
+								yield block;
+								block.h++;
+							}
+							block.v++;
+						}
+					}
+				}
+
+				* ColorBlocks() {
+					for(var idx=0; idx < this.scan.numberOfComponents; idx++) {
+						var component = this.frame.components[this.scan.components[idx].selector];
+						component.DCtable = this.dcTables[this.scan.components[idx].dcEntropyTableDest].huffmanIterator;
+						component.ACtable = this.acTables[this.scan.components[idx].acEntropyTableDest].huffmanIterator;
+						component.quantTable = this.quantizationTables[component.quantizationTableId];
+						component.pred = 0;
+					}					
+					for(var mcu of this.MinimalCodingUnits()) {
+						var cnt = 1;
+						for(var idx=0; idx < this.scan.numberOfComponents; idx++) {
+							var component = this.frame.components[this.scan.components[idx].selector];						
+							component.blockData = new Int32Array(64 * component.verSamplingFactor * component.horSamplingFactor);
+							//component.pred = 0;
+						}							
+						for(var block of this.Blocks(mcu)) {	
+							this.fetchCoefficients(block);
+							//console.log(JSON.stringify(block.component.blockData));
+							this.quantisize(block);
+							this.IDCT(block.component.blockData, block.offset);
+							//console.log(JSON.stringify(block.component.blockData));
+							//console.log("did block", cnt);
+							cnt++;
+						}
+						yield mcu;
+						// throw { message: "one mcu" }
+					}
+				}
+
+				* RgbBlock() {
+
+				}
+
+	            receive(length) {
+	                var n = 0;
+	                while (length > 0) {
+	                    n = n << 1 | this.bits.next().value;
+	                    length--;
+	                }
+	                return n;
+	            }
+
+	            receiveAndExtend(length) {
+	                if (length === 1) {
+	                    return this.bits.next().value === 1 ? 1 : -1;
+	                }
+	                var n = this.receive(length);
+	                if (n >= 1 << length - 1) {
+	                    return n;
+	                }
+	                return n + (-1 << length) + 1;
+	            }
+
+				fetchCoefficients(block) {
+					//console.log(block.offset);
+	                var t = block.component.DCtable.decode();
+	                var diff = t === 0 ? 0 : this.receiveAndExtend(t);
+	                //console.log("pred", block.component.pred, "diff", diff, "calc", block.component.pred + diff);
+	                block.component.blockData[block.offset] = (block.component.pred += diff);
+
+	                //console.log("pred after", block.component.pred);
+	                var k = 1;
+	                while (k < 64) {
+	                    var rs = block.component.ACtable.decode();
+	                    var s = rs & 15, r = rs >> 4;
+	                    if (s === 0) {
+	                        if (r < 15) {
+	                            break;
+	                        }
+	                        k += 16;
+	                        continue;
+	                    }
+	                    k += r;
+	                    var z = zigzag[k];
+	                    block.component.blockData[block.offset + z] = this.receiveAndExtend(s);
+	                    //console.log(block.component.blockData[block.offset + z]);
+	                    k++;
+	                }		
+	                // console.log(block.component.blockData.slice(0, 64));		
+				}
+
+				IDCT(data, offset) {
+					var result = new Float64Array(64);
+					for(var y = 0; y <= 7; y++) {
+						for(var x = 0; x <= 7; x++) {
+							var sum = 0;
+							for(var u = 0; u <= 7; u++) {
+								for(var v = 0; v <= 7; v++) {
+									var cu = (u == 0) ? 1 / Math.sqrt(2) : 1;
+									var cv = (v == 0) ? 1 / Math.sqrt(2) : 1;
+									sum += cu * cv * data[offset + v*8+u] * Math.cos((2*x + 1) * u * 3.1415927 / 16) * Math.cos((2*y + 1) * v * 3.1415927 / 16);
+								}
+							}
+							result[y*8+x] = 0.25 * sum;
+						}
+					}
+				    for(var i = 0; i < 64; i++) {
+				    	var sample = 128 + result[i];
+				    	//console.log(sample);
+				    	data[offset + i] = sample < 0 ? 0 : sample > 0xFF ? 0xFF : sample;
+				    }
+				    //console.log(data.slice(offset, offset + 64));
+				}
+
+				quantisize(block) {
+					//console.log("tbl", block.component.quantTable.items);
+					//console.log("quant", block.offset);
+					//console.log("before quant: ", block.component.blockData.slice(block.offset, block.offset+64));
+					for(var i=0; i<64; i++) {
+						block.component.blockData[block.offset + i] *= block.component.quantTable.items[i];
+					}
+					//console.log("after quant: ", block.component.blockData.slice(block.offset, block.offset+64));					
+				}
+
+				decodeScan() {
+					console.log("decode scan");
+					this.bits = this._stream.bufferedBits();
+					for(var table of this.acTables) {
+						table.huffmanIterator = new HuffmanIterator(this.bits, table.lens, table.vals);
+					}
+					for(var table of this.dcTables) {
+						table.huffmanIterator = new HuffmanIterator(this.bits, table.lens, table.vals);
+					}
+
+					this._imageData = new ImageData(this.frame.samplesPerLine, this.frame.numberOfLines);
+
+					try {
+					var cnt = 0;
+					for(var clr of this.ColorBlocks()) {
+						var blockidx = 0;
+						for(var blockY = 0; blockY < this.frame.maxV; blockY++) {
+							for(var blockX = 0; blockX < this.frame.maxH; blockX++) {
+								for(var y = 0; y < 8; y++) {
+									for(var x = 0; x < 8; x++) {
+										var Y = this.frame.components[this.scan.components[0].selector].blockData[64 * blockidx + y*8+x];
+										var Cb = this.frame.components[this.scan.components[1].selector].blockData[y*8+(x/2|0)];
+										var Cr = this.frame.components[this.scan.components[2].selector].blockData[y*8+(x/2|0)];
+										var targetY = clr.y * 8 * this.frame.maxV + blockY * 8 + y;
+										var targetX = clr.x * 8 * this.frame.maxH + blockX * 8 + x;
+										//console.log(targetX, targetY, Y, Cb, Cr);
+
+										this.convertYccToRgb(Y, Cb, Cr, this._imageData.data, (targetY * this.frame.samplesPerLine + targetX) * 4);
+									}
+								}
+								blockidx++;
+							}
+						}
+						//cnt++;
+						if (cnt == 2)
+							throw "exit";
+					    // copy color data to image data
+					    // console.log(clr);
+					}
+					} catch(e) {
+						console.log(e);
+					}
+					this._worker.postMessage({
+						result: this._imageData
+					});
+					console.log("posted");
+				}
+
+		        clamp0to255(a) {
+		            return a <= 0 ? 0 : a >= 255 ? 255 : a;
+		        }
+
+	            convertYccToRgb(Y, Cb, Cr, data, offset) {
+	            	// for int math
+                    //data[offset]     = this.clamp0to255(Y - 179.456 + 1.402 * Cr);
+                    //data[offset + 1] = this.clamp0to255(Y + 135.459 - .344 * Cb - .714 * Cr);
+                    //data[offset + 2] = this.clamp0to255(Y - 226.816 + 1.772 * Cb);
+
+                    data[offset]     = this.clamp0to255(Y + 1.402 * (Cr - 128));
+                    data[offset + 1] = this.clamp0to255(Y - .3441363 * (Cb - 128) - .71413636 * (Cr - 128));
+                    data[offset + 2] = this.clamp0to255(Y + 1.772 * (Cb - 128));
+
+                    data[offset + 3] = 255;
+                    // console.log(offset, data[offset], data[offset+1], data[offset+2], data[offset+3])
+	            }
+
+				readImage() {
+					var marker = this._stream.readByte();
+					while(marker == 0xFF) {
+						var code = this._stream.readByte();
+						console.log("code", code.toString(16));
+						if (code >= 0xE0 && code <= 0xEF) {
+							this.readApplicationSegment(code);
+						} else if (code == 0xDB) {
+							this.readQuantizationTable(code);
+						} else if (code == 0xC4) {
+							this.readHuffmanTable(code);
+						} else if (code == 0xC0) {
+							this.readBaselineDCT(code);
+						} else if (code == 0xDA) {
+							this.readStartOfScan(code);
+						} else {
+							console.log("img unknown", code);
+						}
+						marker = this._stream.readByte();
+					}			
+					console.log("exit img", marker.toString(16), code.toString(16));
+					console.log("img: " + this._stream.readBytes(20));
+				}
+			}
+
+		    self.addEventListener('message', function(e) { 
+		    	self.importScripts(e.data.url + '/stream.js');
+		        try {
+		        	var png = new Jpg(new Stream(e.data.file), this);
+		       } catch(e){ 
+		            postMessage({ 
+		                result: e.message + " " + e.stack
+		            }); 
+		       }
+		    }, false);
+		</script>
+		<script>
+			function makeWorker(script) {
+			    return new Worker(URL.createObjectURL(new Blob([script])));
+			}
+
+			function processFile(file, cb) {
+			    var syncWorker = makeWorker(
+			        document.getElementById('worker-script').textContent
+			    );
+			    
+			    if (syncWorker) {
+			        syncWorker.onmessage = function(e) {
+			            cb(e.data.result);
+			        };
+			        syncWorker.postMessage({ url: window.location.protocol + '//' + window.location.host, file: file });
+			    }
+			}
+
+			function handleFile(evt) {
+    			var files = evt.target.files;;
+
+		        processFile(files[0], function(src) {
+		        	if (src instanceof ImageData) {
+		        		var canvas = document.getElementById("canvas");
+		        		canvas.width = src.width;
+		        		canvas.height = src.height;
+		        		var ctx = canvas.getContext('2d');
+		        		ctx.putImageData(src, 0, 0);
+		        	} else {
+		        		console.log(src);
+		        	}
+		        });
+			}
+
+			function loadTest(url, text) {
+				var dv = document.createElement("div");
+				var img = document.createElement("img");
+				img.src = url;			
+				dv.appendChild(img);
+        		var canvas = document.createElement("canvas");
+        		canvas.width = 32;
+        		canvas.height = 32;
+        		dv.appendChild(canvas);				
+				var span = document.createElement("span");
+				span.textContent = text;
+				dv.appendChild(span);
+				document.body.appendChild(dv);				
+				var x = new XMLHttpRequest();
+				x.open("GET", url, true);
+				x.responseType = 'blob';
+				x.onload = function (e) {
+			        processFile(x.response, function(src) {
+			        	if (src instanceof ImageData) {
+
+			        		canvas.width = src.width;
+			        		canvas.height = src.height;
+			        		var ctx = canvas.getContext('2d');
+			        		ctx.putImageData(src, 0, 0);
+			        	} else {
+			        		console.log(src);
+			        	}
+			        });						
+				}
+				x.send();		
+			}
+
+			function loadTests() {
+				var x = new XMLHttpRequest();				
+				x.open("GET", "testcases_jpg.json", true);
+				x.responseType = 'json';	
+				x.onload = function(e) {
+					var imgs = e.target.response;
+					var cnt = 0;
+					for(var i=0; i<imgs.length; i++) {
+						var parts = imgs[i].split(" ");
+						//if (parts[0] != "basn0g01") continue;
+						if(parts[0].substring(0, 4) != "http")
+							parts[0] = "testsuite/" + parts[0] + ".jpg";
+						loadTest(parts[0], imgs[i]);
+						break;
+					}
+				}
+				x.send();
+			}
+		</script>
+	</head>
+	<body>
+		<input type="file" onchange="handleFile(event)"/>
+		<input type="button" onclick="loadTests()"/>
+	</body>
+</html>
